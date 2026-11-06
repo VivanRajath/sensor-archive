@@ -1,0 +1,169 @@
+<title>Sensor Archive Simulator</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Step through a fault-tolerant sensor archive: crashes, duplicates, late data, corrections and similarity search, simulated in Go.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/*__STYLE__*/
+</style>
+
+<header class="top">
+  <div class="top-row">
+    <h1 class="brand">Sensor Archive Simulator</h1>
+    <select id="scenario" aria-label="Scenario"></select>
+    <div class="seg" id="mode-seg" role="group" aria-label="Mode">
+      <button id="mode-design" aria-pressed="true">My design</button>
+      <button id="mode-naive" aria-pressed="false">Naive</button>
+      <button id="mode-custom" aria-pressed="false">Custom</button>
+    </div>
+    <button class="btn ghost" id="tour-btn" title="Walk through what everything on this page means">? Guide</button>
+    <details class="menu">
+      <summary class="btn" aria-label="Settings">⚙ Settings</summary>
+      <div class="menu-body">
+        <label class="ctl" for="speed">Playback speed
+          <select id="speed"><option value="3">3 min/s</option><option value="8" selected>8 min/s</option><option value="20">20 min/s</option><option value="60">60 min/s</option></select>
+        </label>
+        <label class="ctl" for="upload">Upload to object storage every
+          <select id="upload"><option value="5">5 min</option><option value="30" selected>30 min</option><option value="60">60 min</option></select>
+        </label>
+      </div>
+    </details>
+  </div>
+  <div class="top-row transport">
+    <button class="btn primary" id="play">Play</button>
+    <button class="btn" id="step1">+1 min</button>
+    <button class="btn" id="step10">+10 min</button>
+    <button class="btn" id="tonext">Next pause ⏭</button>
+    <button class="btn ghost" id="restart">↺ Restart</button>
+    <div class="clock"><b id="clock">—</b><span id="rel">T+0</span></div>
+    <div class="progress" aria-hidden="true"><i id="prog"></i></div>
+  </div>
+</header>
+
+<div id="boot" class="boot">Loading the Go engine…</div>
+
+<main class="grid" id="app" hidden>
+  <aside class="col col-side">
+    <section class="panel cp" id="cp" hidden></section>
+    <section class="panel scn" id="scn"></section>
+    <section class="panel" id="custom" hidden>
+      <div class="panel-head"><h2>Custom switches</h2><span class="sub">changes restart the run</span></div>
+      <div class="toggles">
+        <label for="t-ack">When to say "success"
+          <select id="t-ack"><option value="quorum">after fsync on 2 of 3 machines</option><option value="local-fsync">after fsync on the leader only</option><option value="on-receive">as soon as it arrives</option></select></label>
+        <label><input type="checkbox" id="t-dedup" checked> Recognise retries by event ID</label>
+        <label><input type="checkbox" id="t-order" checked> Order history by event time</label>
+        <label><input type="checkbox" id="t-corr" checked> Corrections add versions</label>
+        <label><input type="checkbox" id="t-late" checked> Accept late data</label>
+      </div>
+    </section>
+    <section class="panel" id="inv"></section>
+  </aside>
+
+  <div class="col col-main">
+    <section class="panel" id="cluster">
+      <div class="panel-head"><h2>Replicated log · 3 machines</h2><span class="sub mono" id="term"></span></div>
+      <div class="cluster-meta" id="cmeta"></div>
+      <div class="nodes" id="nodes"></div>
+      <div class="cluster-foot">
+        <div class="legend">
+          <span><i class="cell cache"></i> page cache</span>
+          <span><i class="cell disk"></i> fsynced</span>
+          <span><i class="cell committed"></i> committed (2 of 3)</span>
+          <span><i class="cell committed uploaded"></i> in object storage</span>
+        </div>
+        <details class="inline-more">
+          <summary>Timed crashes</summary>
+          <div class="row">
+            <button class="btn sm danger" id="arm-append">Crash leader after next append</button>
+            <button class="btn sm danger" id="arm-ack">Crash leader (and disk) after next ack</button>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section class="panel" id="detail">
+      <div class="panel-head"><h2>Stations</h2><span class="sub">pick one · number = readings waiting on it</span></div>
+      <div class="stations" id="stations"></div>
+      <div class="detail-head">
+        <h3 id="d-title">Station</h3>
+        <div class="row">
+          <button class="btn sm" id="a-online">Go offline</button>
+          <button class="btn sm" id="a-drop">Lose acks 20 min</button>
+          <button class="btn sm" id="a-resend">Resend last batch</button>
+        </div>
+      </div>
+      <span class="sub" id="d-sub"></span>
+      <details class="inline-more">
+        <summary>More station faults</summary>
+        <div class="row">
+          <label class="ctl" for="a-jitter">Delay <select id="a-jitter"><option value="1">1–2 min</option><option value="5">1–6 min</option><option value="9">1–10 min</option></select></label>
+          <label class="ctl" for="a-skew">Clock <select id="a-skew"><option value="0">correct</option><option value="120">+2 h fast</option><option value="-90">−90 min</option></select></label>
+          <label class="ctl" for="a-schema">Schema <select id="a-schema"><option value="1">v1 °C</option><option value="2">v2 °F</option><option value="3">v3 K</option></select></label>
+          <button class="btn sm" id="a-conv">Deploy v3 converter</button>
+        </div>
+      </details>
+
+      <canvas class="chart" id="h-chart" height="150"></canvas>
+      <div class="panel-head">
+        <div class="history-meta" id="h-meta"></div>
+        <select id="h-view" aria-label="Rows to show">
+          <option value="latest">Latest 80 rows</option><option value="flagged">Corrected or flagged</option><option value="late">Over 30 min late</option></select>
+      </div>
+      <div class="table-wrap" id="h-wrap">
+        <table>
+          <thead><tr><th class="num">Seq</th><th>Measured</th><th>Received</th><th class="num">Late</th><th class="num">°C</th><th class="num">Ver</th><th>Tier</th><th>Flags</th></tr></thead>
+          <tbody id="h-body"></tbody>
+        </table>
+      </div>
+      <details class="inline-more" id="corr-box">
+        <summary>Send a correction <span class="sub">(or click a row)</span></summary>
+        <form class="corr" id="corr">
+          <span class="sub">Reading #</span>
+          <input type="number" id="c-seq" aria-label="Sequence number">
+          <span class="sub">→</span>
+          <input type="number" id="c-val" step="0.1" aria-label="Corrected value in °C">
+          <span class="sub">°C</span>
+          <button class="btn sm primary" type="submit">Send</button>
+        </form>
+      </details>
+    </section>
+
+    <section class="panel" id="extras">
+      <div class="tabs" role="tablist" aria-label="Details">
+        <button role="tab" id="tab-sim" aria-selected="true" aria-controls="pane-sim">Similar stations</button>
+        <button role="tab" id="tab-log" aria-selected="false" aria-controls="pane-log">Event log</button>
+        <button role="tab" id="tab-store" aria-selected="false" aria-controls="pane-store">Storage <span class="badge" id="q-badge" hidden></span></button>
+      </div>
+
+      <div class="pane" id="pane-sim" role="tabpanel">
+        <div class="panel-head"><span>Most like station <b id="s-target">A</b></span><span class="sub" id="s-sub"></span></div>
+        <div class="matches" id="matches"></div>
+        <canvas class="chart" id="s-chart" height="150"></canvas>
+        <span class="sub" id="s-note">Average temperature for each hour of the day over the last 2 days.</span>
+      </div>
+
+      <div class="pane" id="pane-log" role="tabpanel" hidden>
+        <div class="seg" role="group" aria-label="Log filter"><button id="lf-key" aria-pressed="true">Key events</button><button id="lf-all" aria-pressed="false">Everything</button></div>
+        <div class="log" id="log"></div>
+      </div>
+
+      <div class="pane" id="pane-store" role="tabpanel" hidden>
+        <div class="panel-head"><span>Parquet partitions</span><span class="sub">day × station bucket · rows (+delta)</span></div>
+        <div class="parts" id="parts"></div>
+        <div class="panel-head"><span>Quarantine</span><span class="sub" id="q-n"></span></div>
+        <ul class="qlist" id="qlist"></ul>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>One tick is one simulated minute. The archive starts with 3 days of history from 12 stations. Everything is computed live by the Go engine (compiled to WebAssembly) in your browser.</footer>
+
+<script>
+/*__WASM_EXEC__*/
+</script>
+<script>
+/*__APP__*/
+</script>

@@ -1,0 +1,1758 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}[hidden]{display:none!important}</style>
+</head>
+<body>
+<title>Sensor Archive Simulator</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Step through a fault-tolerant sensor archive: crashes, duplicates, late data, corrections and similarity search, simulated in Go.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: an instrument panel. Transport bar on top, then three working columns:
+   the guided story + correctness meters, the live system (cluster, stations, history),
+   and the evidence (similarity, event log, storage). Collapses to one column on phones. */
+:root {
+  --bg: #e9edf1;
+  --panel: #f8fafb;
+  --panel-2: #eef2f5;
+  --line: #cfd7df;
+  --ink: #142231;
+  --ink-2: #4a5b6c;
+  --ink-3: #7b8b9b;
+  --accent: #1f5fbf;
+  --accent-ink: #ffffff;
+  --accent-soft: #dce7f7;
+  --good: #1d7a4c;
+  --good-soft: #dcefe4;
+  --warn: #a5650a;
+  --warn-soft: #f6ead6;
+  --bad: #b3261e;
+  --bad-soft: #f7dedb;
+  --hatch: #b9c4cf;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --r: 6px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f151c; --panel: #161e27; --panel-2: #1c2632; --line: #2b3846;
+    --ink: #e3eaf1; --ink-2: #a5b3c1; --ink-3: #74859a;
+    --accent: #6ea2f0; --accent-ink: #0b1420; --accent-soft: #1d3150;
+    --good: #5cc28d; --good-soft: #163527; --warn: #e3a64a; --warn-soft: #3a2c14;
+    --bad: #f0796f; --bad-soft: #401c1a; --hatch: #3a4858;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f151c; --panel: #161e27; --panel-2: #1c2632; --line: #2b3846;
+  --ink: #e3eaf1; --ink-2: #a5b3c1; --ink-3: #74859a;
+  --accent: #6ea2f0; --accent-ink: #0b1420; --accent-soft: #1d3150;
+  --good: #5cc28d; --good-soft: #163527; --warn: #e3a64a; --warn-soft: #3a2c14;
+  --bad: #f0796f; --bad-soft: #401c1a; --hatch: #3a4858;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--ink); font-family: var(--f-body); font-size: 14px; line-height: 1.45;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 32px;
+}
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--panel); }
+button, select, input { font: inherit; color: inherit; }
+.mono, .num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+h1, h2, h3 { font-family: var(--f-display); margin: 0; text-wrap: balance; }
+h2 { font-size: 13px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- top bar ---------- */
+.top {
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; margin-inline: calc(-1 * max(16px, env(safe-area-inset-left, 0px))) calc(-1 * max(16px, env(safe-area-inset-right, 0px)));
+  padding: 10px max(16px, env(safe-area-inset-right, 0px)) 10px max(16px, env(safe-area-inset-left, 0px));
+  background: var(--panel); border-bottom: 1px solid var(--line);
+  display: grid; gap: 8px;
+}
+.top-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; min-width: 0; }
+.brand { font-size: 18px; font-weight: 700; letter-spacing: -.01em; margin-right: auto; white-space: nowrap; }
+#scenario { max-width: min(100%, 340px); }
+.ctl { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; font-size: 12px; color: var(--ink-2); }
+.row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+/* settings popover */
+.menu { position: relative; }
+.menu > summary { list-style: none; }
+.menu > summary::-webkit-details-marker { display: none; }
+.menu[open] > summary { border-color: var(--ink-3); }
+.menu-body {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; width: max-content; max-width: calc(100vw - 32px);
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 12px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / .18); display: grid; gap: 10px;
+}
+.menu-body .ctl { justify-content: space-between; gap: 12px; }
+
+/* quiet disclosure for secondary controls */
+.inline-more > summary { cursor: pointer; font-size: 12px; color: var(--ink-2); width: fit-content; padding: 2px 0; }
+.inline-more > summary:hover { color: var(--ink); }
+.inline-more[open] > summary { margin-bottom: 8px; }
+
+/* tabs */
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin: -4px 0 2px; overflow-x: auto; }
+.tabs button {
+  border: 0; background: none; padding: 6px 12px 8px; cursor: pointer; font-family: var(--f-display); font-weight: 600;
+  font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-3); border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
+}
+.tabs button:hover { color: var(--ink); }
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+.pane { display: flex; flex-direction: column; gap: 10px; }
+.badge { font-family: var(--f-mono); font-size: 10.5px; background: var(--warn-soft); color: var(--warn); padding: 0 6px; border-radius: 999px; margin-left: 4px; }
+select, input[type=number] {
+  max-width: 100%;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r); padding: 5px 8px; min-width: 0;
+}
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+.seg button { border: 0; background: var(--panel-2); padding: 5px 11px; cursor: pointer; font-weight: 500; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--panel); }
+.btn {
+  border: 1px solid var(--line); background: var(--panel-2); border-radius: var(--r); padding: 5px 11px; cursor: pointer; font-weight: 500; white-space: nowrap;
+}
+.btn:hover:not(:disabled) { border-color: var(--ink-3); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.danger { color: var(--bad); }
+.btn.sm { padding: 3px 8px; font-size: 12px; }
+.btn.ghost { background: none; border-color: transparent; color: var(--ink-2); }
+.btn.ghost:hover { color: var(--ink); }
+
+.transport { gap: 8px; }
+.clock { font-family: var(--f-mono); font-size: 12px; display: flex; gap: 10px; align-items: baseline; margin-left: 6px; color: var(--ink-3); }
+.clock b { font-size: 16px; font-weight: 600; color: var(--ink); }
+.progress { flex: 1 1 160px; height: 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; min-width: 120px; }
+.progress i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+
+/* ---------- grid ---------- */
+.grid { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); padding-top: 16px; max-width: 1480px; margin-inline: auto; }
+@media (min-width: 980px) {
+  .grid { grid-template-columns: 320px minmax(0, 1fr); align-items: start; }
+  .col-side { position: sticky; top: 112px; max-height: calc(100vh - 128px); overflow-y: auto; scrollbar-width: thin; }
+}
+@media (min-width: 1300px) { .grid { grid-template-columns: 360px minmax(0, 1fr); } }
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.sub { color: var(--ink-3); font-size: 12px; }
+
+/* ---------- scenario + checkpoint ---------- */
+.case { font-family: var(--f-mono); font-size: 11px; color: var(--accent); letter-spacing: .04em; text-transform: uppercase; }
+.scn-title { font-size: 22px; font-weight: 600; line-height: 1.15; }
+.scn p { margin: 0; color: var(--ink-2); max-width: 62ch; }
+.watch { margin: 0; padding-left: 18px; color: var(--ink-2); display: grid; gap: 2px; }
+.cp { border-color: var(--accent); background: var(--accent-soft); }
+.cp h3 { font-size: 17px; font-weight: 600; }
+.cp p { margin: 0; max-width: 62ch; }
+.cp .cp-n { font-family: var(--f-mono); font-size: 11px; color: var(--ink-2); }
+.cp-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ---------- invariants ---------- */
+.hero-metric { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; align-items: center; padding: 10px 12px; border-radius: var(--r); background: var(--good-soft); }
+.hero-metric.bad { background: var(--bad-soft); }
+.hero-metric .num { font-size: 34px; font-weight: 600; line-height: 1; color: var(--good); grid-row: span 2; }
+.hero-metric.bad .num { color: var(--bad); }
+.hero-metric b { font-family: var(--f-display); font-size: 15px; }
+.hero-metric span { font-size: 12px; color: var(--ink-2); }
+.metrics { display: grid; grid-template-columns: 1fr auto; gap: 0; margin: 0; }
+.metrics dt, .metrics dd { padding: 5px 0; border-bottom: 1px solid var(--line); margin: 0; }
+.metrics dd { text-align: right; font-family: var(--f-mono); font-variant-numeric: tabular-nums; padding-left: 12px; }
+.metrics .is-bad { color: var(--bad); font-weight: 600; }
+.metrics .is-warn { color: var(--warn); font-weight: 600; }
+.metrics .is-good { color: var(--good); }
+.metrics dt small { display: block; color: var(--ink-3); font-size: 11px; }
+.all-clear { font-size: 12px; color: var(--ink-3); background: none; border: 0; padding: 0; cursor: pointer; text-align: left; }
+.all-clear:hover { color: var(--ink); }
+
+.toggles { display: grid; gap: 6px; }
+.toggles label { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
+.toggles label input { margin-top: 3px; }
+
+/* ---------- cluster ---------- */
+.cluster-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; font-family: var(--f-mono); font-size: 12px; color: var(--ink-2); }
+.cluster-meta b { color: var(--ink); font-weight: 600; }
+.nodes { display: grid; gap: 10px; }
+.node { border: 1px solid var(--line); border-radius: var(--r); padding: 10px; display: grid; gap: 8px; background: var(--panel); }
+.node.down { background: repeating-linear-gradient(135deg, var(--panel-2) 0 8px, var(--panel) 8px 16px); }
+.node-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.node-head h3 { font-size: 15px; font-weight: 600; }
+.zone { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); }
+.pill { font-family: var(--f-display); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; padding: 1px 7px; border-radius: 999px; }
+.pill.leader { background: var(--accent); color: var(--accent-ink); }
+.pill.follower { background: var(--panel-2); color: var(--ink-2); border: 1px solid var(--line); }
+.pill.down { background: var(--bad-soft); color: var(--bad); }
+.node-stats { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); }
+.node-head .node-actions { margin-left: auto; }
+.cluster-meta .mini { display: inline-flex; align-items: center; gap: 6px; }
+.cluster-meta .meter { width: 70px; }
+.cluster-foot { display: flex; flex-wrap: wrap; gap: 8px 16px; justify-content: space-between; align-items: flex-start; }
+.tape { display: flex; gap: 3px; overflow-x: auto; padding-bottom: 2px; }
+.cell {
+  flex: 0 0 auto; width: 34px; height: 34px; border-radius: 4px; display: grid; place-items: center; position: relative;
+  font-family: var(--f-mono); font-size: 11px; line-height: 1; border: 1px solid var(--line);
+}
+.cell small { position: absolute; top: 2px; left: 3px; font-size: 8px; color: var(--ink-3); }
+.cell.cache { border-style: dashed; border-color: var(--warn); color: var(--warn); background: repeating-linear-gradient(135deg, transparent 0 4px, var(--warn-soft) 4px 8px); }
+.cell.disk { background: var(--panel-2); }
+.cell.committed { background: var(--accent-soft); border-color: var(--accent); }
+.cell.uploaded::after { content: ""; position: absolute; bottom: 3px; right: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--good); }
+.tape-empty { font-size: 12px; color: var(--ink-3); padding: 9px 0; }
+.node-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11.5px; color: var(--ink-2); align-items: center; }
+.legend .cell { width: 16px; height: 16px; }
+.legend span { display: inline-flex; gap: 6px; align-items: center; }
+.meter { height: 8px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.meter i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+.meter.hot i { background: var(--warn); }
+.arm { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* ---------- stations ---------- */
+.stations { display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 6px; }
+@media (max-width: 560px) { .stations { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+.stn {
+  border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); padding: 6px 7px; text-align: left; cursor: pointer; display: grid; gap: 1px; min-width: 0;
+}
+.stn[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.stn-top { display: flex; align-items: center; gap: 5px; }
+.stn b { font-family: var(--f-display); font-size: 16px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); flex: 0 0 auto; }
+.dot.off { background: var(--bad); }
+.dot.silent { background: var(--ink-3); }
+.dot.warn { background: var(--warn); }
+.stn span { font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stn .buf { font-family: var(--f-mono); font-size: 11px; color: var(--ink-2); }
+
+/* ---------- station detail ---------- */
+.detail-head { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; justify-content: space-between; padding-top: 12px; border-top: 1px solid var(--line); }
+.detail-head h3 { font-size: 18px; font-weight: 600; }
+#d-sub { margin-top: -6px; }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.actions .ctl { gap: 4px; }
+.corr { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px; background: var(--panel-2); border-radius: var(--r); }
+.corr input { width: 88px; }
+canvas { width: 100%; display: block; }
+.chart { height: 150px; }
+.table-wrap { overflow: auto; max-height: 280px; border: 1px solid var(--line); border-radius: var(--r); }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { padding: 4px 8px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
+th { position: sticky; top: 0; background: var(--panel-2); font-family: var(--f-display); font-weight: 600; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-2); z-index: 1; }
+td.num, th.num { text-align: right; font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+td.mono { font-family: var(--f-mono); }
+tr.dup td { background: var(--bad-soft); }
+tr.moved td { background: var(--warn-soft); }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--accent-soft); }
+.tag { display: inline-block; font-family: var(--f-mono); font-size: 10.5px; padding: 0 5px; border-radius: 3px; margin-right: 3px; background: var(--panel-2); border: 1px solid var(--line); }
+.tag.bad { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
+.tag.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+.tag.good { color: var(--good); border-color: var(--good); background: var(--good-soft); }
+.tier-recent { color: var(--accent); }
+.tier-parquet { color: var(--ink-2); }
+.tier-delta { color: var(--warn); font-weight: 600; }
+.versions td { background: var(--panel-2); white-space: normal; }
+.history-meta { font-size: 12px; color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 4px 12px; }
+
+/* ---------- similarity ---------- */
+.matches { display: grid; gap: 4px; }
+.match { display: grid; grid-template-columns: 20px 92px minmax(0, 1fr) 44px; gap: 8px; align-items: center; font-size: 12.5px; }
+.match b { font-family: var(--f-display); font-size: 15px; }
+.match .bar { height: 10px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+.match .bar i { display: block; height: 100%; background: var(--accent); }
+.match.ex { color: var(--ink-3); }
+.match.ex .bar { background: repeating-linear-gradient(135deg, var(--panel-2) 0 4px, transparent 4px 8px); }
+.match .num { text-align: right; font-size: 12px; }
+
+/* ---------- log ---------- */
+.log { display: grid; gap: 0; max-height: 420px; overflow: auto; border: 1px solid var(--line); border-radius: var(--r); }
+.ev { display: grid; grid-template-columns: 54px 1fr; gap: 8px; padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 12.5px; border-left: 3px solid transparent; }
+.ev time { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); padding-top: 1px; }
+.ev.good { border-left-color: var(--good); }
+.ev.warn { border-left-color: var(--warn); }
+.ev.bad { border-left-color: var(--bad); background: var(--bad-soft); }
+.ev.checkpoint { border-left-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.ev .k { font-family: var(--f-mono); font-size: 10.5px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .04em; margin-right: 4px; }
+
+/* ---------- storage ---------- */
+.parts { display: grid; grid-template-columns: 52px repeat(4, minmax(0, 1fr)); gap: 3px; font-size: 11px; font-family: var(--f-mono); }
+.parts .h { color: var(--ink-3); text-align: center; }
+.parts .d { color: var(--ink-3); align-self: center; }
+.part { border: 1px solid var(--line); border-radius: 3px; padding: 3px 4px; text-align: center; background: var(--panel-2); }
+.part.sealed { background: var(--panel); border-color: var(--ink-3); }
+.part .delta { color: var(--warn); font-weight: 600; }
+.qlist { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; font-size: 12px; }
+.qlist li { padding: 5px 8px; border-radius: 4px; background: var(--warn-soft); }
+
+.boot { padding: 40px 0; text-align: center; color: var(--ink-2); font-family: var(--f-mono); }
+.boot.err { color: var(--bad); }
+footer { margin-top: 18px; color: var(--ink-3); font-size: 12px; max-width: 80ch; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* ---------- guided tour ---------- */
+.tour-block { position: fixed; inset: 0; z-index: 49; }
+.tour-hole {
+  position: fixed; z-index: 50; border-radius: 8px; pointer-events: none;
+  box-shadow: 0 0 0 9999px rgb(6 12 20 / .64); outline: 2px solid var(--accent); outline-offset: 2px;
+  transition: top .25s, left .25s, width .25s, height .25s;
+}
+.tour-hole.center { top: 50% !important; left: 50% !important; width: 0 !important; height: 0 !important; outline: 0; }
+.tour-card {
+  position: fixed; z-index: 51; width: min(400px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px;
+  box-shadow: 0 16px 40px rgb(0 0 0 / .35); display: grid; gap: 10px;
+  transition: top .25s, left .25s;
+}
+.tour-card .t-step { font-family: var(--f-mono); font-size: 11px; color: var(--accent); letter-spacing: .04em; text-transform: uppercase; }
+.tour-card h3 { font-size: 19px; font-weight: 600; }
+.tour-card p { margin: 0; color: var(--ink-2); }
+.tour-look { background: var(--warn-soft); border-left: 3px solid var(--warn); border-radius: 4px; padding: 8px 10px; font-size: 13px; }
+.tour-look b { display: block; font-family: var(--f-display); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--warn); margin-bottom: 2px; }
+.tour-look ul { margin: 0; padding-left: 18px; display: grid; gap: 3px; }
+.tour-keys { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--ink-2); }
+.tour-keys i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 4px; }
+.tour-nav { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.tour-dots { display: flex; gap: 4px; margin-right: auto; flex-wrap: wrap; }
+.tour-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--line); }
+.tour-dots span.on { background: var(--accent); }
+@media (max-width: 640px) {
+  .tour-card { left: 16px !important; right: 16px; top: auto !important; bottom: 16px; width: auto; max-height: 55vh; }
+}
+@media (prefers-reduced-motion: reduce) { .tour-hole, .tour-card { transition: none; } }
+
+</style>
+
+<header class="top">
+  <div class="top-row">
+    <h1 class="brand">Sensor Archive Simulator</h1>
+    <select id="scenario" aria-label="Scenario"></select>
+    <div class="seg" id="mode-seg" role="group" aria-label="Mode">
+      <button id="mode-design" aria-pressed="true">My design</button>
+      <button id="mode-naive" aria-pressed="false">Naive</button>
+      <button id="mode-custom" aria-pressed="false">Custom</button>
+    </div>
+    <button class="btn ghost" id="tour-btn" title="Walk through what everything on this page means">? Guide</button>
+    <details class="menu">
+      <summary class="btn" aria-label="Settings">⚙ Settings</summary>
+      <div class="menu-body">
+        <label class="ctl" for="speed">Playback speed
+          <select id="speed"><option value="3">3 min/s</option><option value="8" selected>8 min/s</option><option value="20">20 min/s</option><option value="60">60 min/s</option></select>
+        </label>
+        <label class="ctl" for="upload">Upload to object storage every
+          <select id="upload"><option value="5">5 min</option><option value="30" selected>30 min</option><option value="60">60 min</option></select>
+        </label>
+      </div>
+    </details>
+  </div>
+  <div class="top-row transport">
+    <button class="btn primary" id="play">Play</button>
+    <button class="btn" id="step1">+1 min</button>
+    <button class="btn" id="step10">+10 min</button>
+    <button class="btn" id="tonext">Next pause ⏭</button>
+    <button class="btn ghost" id="restart">↺ Restart</button>
+    <div class="clock"><b id="clock">—</b><span id="rel">T+0</span></div>
+    <div class="progress" aria-hidden="true"><i id="prog"></i></div>
+  </div>
+</header>
+
+<div id="boot" class="boot">Loading the Go engine…</div>
+
+<main class="grid" id="app" hidden>
+  <aside class="col col-side">
+    <section class="panel cp" id="cp" hidden></section>
+    <section class="panel scn" id="scn"></section>
+    <section class="panel" id="custom" hidden>
+      <div class="panel-head"><h2>Custom switches</h2><span class="sub">changes restart the run</span></div>
+      <div class="toggles">
+        <label for="t-ack">When to say "success"
+          <select id="t-ack"><option value="quorum">after fsync on 2 of 3 machines</option><option value="local-fsync">after fsync on the leader only</option><option value="on-receive">as soon as it arrives</option></select></label>
+        <label><input type="checkbox" id="t-dedup" checked> Recognise retries by event ID</label>
+        <label><input type="checkbox" id="t-order" checked> Order history by event time</label>
+        <label><input type="checkbox" id="t-corr" checked> Corrections add versions</label>
+        <label><input type="checkbox" id="t-late" checked> Accept late data</label>
+      </div>
+    </section>
+    <section class="panel" id="inv"></section>
+  </aside>
+
+  <div class="col col-main">
+    <section class="panel" id="cluster">
+      <div class="panel-head"><h2>Replicated log · 3 machines</h2><span class="sub mono" id="term"></span></div>
+      <div class="cluster-meta" id="cmeta"></div>
+      <div class="nodes" id="nodes"></div>
+      <div class="cluster-foot">
+        <div class="legend">
+          <span><i class="cell cache"></i> page cache</span>
+          <span><i class="cell disk"></i> fsynced</span>
+          <span><i class="cell committed"></i> committed (2 of 3)</span>
+          <span><i class="cell committed uploaded"></i> in object storage</span>
+        </div>
+        <details class="inline-more">
+          <summary>Timed crashes</summary>
+          <div class="row">
+            <button class="btn sm danger" id="arm-append">Crash leader after next append</button>
+            <button class="btn sm danger" id="arm-ack">Crash leader (and disk) after next ack</button>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section class="panel" id="detail">
+      <div class="panel-head"><h2>Stations</h2><span class="sub">pick one · number = readings waiting on it</span></div>
+      <div class="stations" id="stations"></div>
+      <div class="detail-head">
+        <h3 id="d-title">Station</h3>
+        <div class="row">
+          <button class="btn sm" id="a-online">Go offline</button>
+          <button class="btn sm" id="a-drop">Lose acks 20 min</button>
+          <button class="btn sm" id="a-resend">Resend last batch</button>
+        </div>
+      </div>
+      <span class="sub" id="d-sub"></span>
+      <details class="inline-more">
+        <summary>More station faults</summary>
+        <div class="row">
+          <label class="ctl" for="a-jitter">Delay <select id="a-jitter"><option value="1">1–2 min</option><option value="5">1–6 min</option><option value="9">1–10 min</option></select></label>
+          <label class="ctl" for="a-skew">Clock <select id="a-skew"><option value="0">correct</option><option value="120">+2 h fast</option><option value="-90">−90 min</option></select></label>
+          <label class="ctl" for="a-schema">Schema <select id="a-schema"><option value="1">v1 °C</option><option value="2">v2 °F</option><option value="3">v3 K</option></select></label>
+          <button class="btn sm" id="a-conv">Deploy v3 converter</button>
+        </div>
+      </details>
+
+      <canvas class="chart" id="h-chart" height="150"></canvas>
+      <div class="panel-head">
+        <div class="history-meta" id="h-meta"></div>
+        <select id="h-view" aria-label="Rows to show">
+          <option value="latest">Latest 80 rows</option><option value="flagged">Corrected or flagged</option><option value="late">Over 30 min late</option></select>
+      </div>
+      <div class="table-wrap" id="h-wrap">
+        <table>
+          <thead><tr><th class="num">Seq</th><th>Measured</th><th>Received</th><th class="num">Late</th><th class="num">°C</th><th class="num">Ver</th><th>Tier</th><th>Flags</th></tr></thead>
+          <tbody id="h-body"></tbody>
+        </table>
+      </div>
+      <details class="inline-more" id="corr-box">
+        <summary>Send a correction <span class="sub">(or click a row)</span></summary>
+        <form class="corr" id="corr">
+          <span class="sub">Reading #</span>
+          <input type="number" id="c-seq" aria-label="Sequence number">
+          <span class="sub">→</span>
+          <input type="number" id="c-val" step="0.1" aria-label="Corrected value in °C">
+          <span class="sub">°C</span>
+          <button class="btn sm primary" type="submit">Send</button>
+        </form>
+      </details>
+    </section>
+
+    <section class="panel" id="extras">
+      <div class="tabs" role="tablist" aria-label="Details">
+        <button role="tab" id="tab-sim" aria-selected="true" aria-controls="pane-sim">Similar stations</button>
+        <button role="tab" id="tab-log" aria-selected="false" aria-controls="pane-log">Event log</button>
+        <button role="tab" id="tab-store" aria-selected="false" aria-controls="pane-store">Storage <span class="badge" id="q-badge" hidden></span></button>
+      </div>
+
+      <div class="pane" id="pane-sim" role="tabpanel">
+        <div class="panel-head"><span>Most like station <b id="s-target">A</b></span><span class="sub" id="s-sub"></span></div>
+        <div class="matches" id="matches"></div>
+        <canvas class="chart" id="s-chart" height="150"></canvas>
+        <span class="sub" id="s-note">Average temperature for each hour of the day over the last 2 days.</span>
+      </div>
+
+      <div class="pane" id="pane-log" role="tabpanel" hidden>
+        <div class="seg" role="group" aria-label="Log filter"><button id="lf-key" aria-pressed="true">Key events</button><button id="lf-all" aria-pressed="false">Everything</button></div>
+        <div class="log" id="log"></div>
+      </div>
+
+      <div class="pane" id="pane-store" role="tabpanel" hidden>
+        <div class="panel-head"><span>Parquet partitions</span><span class="sub">day × station bucket · rows (+delta)</span></div>
+        <div class="parts" id="parts"></div>
+        <div class="panel-head"><span>Quarantine</span><span class="sub" id="q-n"></span></div>
+        <ul class="qlist" id="qlist"></ul>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>One tick is one simulated minute. The archive starts with 3 days of history from 12 stations. Everything is computed live by the Go engine (compiled to WebAssembly) in your browser.</footer>
+
+<script>
+// Copyright 2018 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+"use strict";
+
+(() => {
+	const enosys = () => {
+		const err = new Error("not implemented");
+		err.code = "ENOSYS";
+		return err;
+	};
+
+	if (!globalThis.fs) {
+		let outputBuf = "";
+		globalThis.fs = {
+			constants: { O_WRONLY: -1, O_RDWR: -1, O_CREAT: -1, O_TRUNC: -1, O_APPEND: -1, O_EXCL: -1, O_DIRECTORY: -1 }, // unused
+			writeSync(fd, buf) {
+				outputBuf += decoder.decode(buf);
+				const nl = outputBuf.lastIndexOf("\n");
+				if (nl != -1) {
+					console.log(outputBuf.substring(0, nl));
+					outputBuf = outputBuf.substring(nl + 1);
+				}
+				return buf.length;
+			},
+			write(fd, buf, offset, length, position, callback) {
+				if (offset !== 0 || length !== buf.length || position !== null) {
+					callback(enosys());
+					return;
+				}
+				const n = this.writeSync(fd, buf);
+				callback(null, n);
+			},
+			chmod(path, mode, callback) { callback(enosys()); },
+			chown(path, uid, gid, callback) { callback(enosys()); },
+			close(fd, callback) { callback(enosys()); },
+			fchmod(fd, mode, callback) { callback(enosys()); },
+			fchown(fd, uid, gid, callback) { callback(enosys()); },
+			fstat(fd, callback) { callback(enosys()); },
+			fsync(fd, callback) { callback(null); },
+			ftruncate(fd, length, callback) { callback(enosys()); },
+			lchown(path, uid, gid, callback) { callback(enosys()); },
+			link(path, link, callback) { callback(enosys()); },
+			lstat(path, callback) { callback(enosys()); },
+			mkdir(path, perm, callback) { callback(enosys()); },
+			open(path, flags, mode, callback) { callback(enosys()); },
+			read(fd, buffer, offset, length, position, callback) { callback(enosys()); },
+			readdir(path, callback) { callback(enosys()); },
+			readlink(path, callback) { callback(enosys()); },
+			rename(from, to, callback) { callback(enosys()); },
+			rmdir(path, callback) { callback(enosys()); },
+			stat(path, callback) { callback(enosys()); },
+			symlink(path, link, callback) { callback(enosys()); },
+			truncate(path, length, callback) { callback(enosys()); },
+			unlink(path, callback) { callback(enosys()); },
+			utimes(path, atime, mtime, callback) { callback(enosys()); },
+		};
+	}
+
+	if (!globalThis.process) {
+		globalThis.process = {
+			getuid() { return -1; },
+			getgid() { return -1; },
+			geteuid() { return -1; },
+			getegid() { return -1; },
+			getgroups() { throw enosys(); },
+			pid: -1,
+			ppid: -1,
+			umask() { throw enosys(); },
+			cwd() { throw enosys(); },
+			chdir() { throw enosys(); },
+		}
+	}
+
+	if (!globalThis.path) {
+		globalThis.path = {
+			resolve(...pathSegments) {
+				return pathSegments.join("/");
+			}
+		}
+	}
+
+	if (!globalThis.crypto) {
+		throw new Error("globalThis.crypto is not available, polyfill required (crypto.getRandomValues only)");
+	}
+
+	if (!globalThis.performance) {
+		throw new Error("globalThis.performance is not available, polyfill required (performance.now only)");
+	}
+
+	if (!globalThis.TextEncoder) {
+		throw new Error("globalThis.TextEncoder is not available, polyfill required");
+	}
+
+	if (!globalThis.TextDecoder) {
+		throw new Error("globalThis.TextDecoder is not available, polyfill required");
+	}
+
+	const encoder = new TextEncoder("utf-8");
+	const decoder = new TextDecoder("utf-8");
+
+	globalThis.Go = class {
+		constructor() {
+			this.argv = ["js"];
+			this.env = {};
+			this.exit = (code) => {
+				if (code !== 0) {
+					console.warn("exit code:", code);
+				}
+			};
+			this._exitPromise = new Promise((resolve) => {
+				this._resolveExitPromise = resolve;
+			});
+			this._pendingEvent = null;
+			this._scheduledTimeouts = new Map();
+			this._nextCallbackTimeoutID = 1;
+
+			const setInt64 = (addr, v) => {
+				this.mem.setUint32(addr + 0, v, true);
+				this.mem.setUint32(addr + 4, Math.floor(v / 4294967296), true);
+			}
+
+			const setInt32 = (addr, v) => {
+				this.mem.setUint32(addr + 0, v, true);
+			}
+
+			const getInt64 = (addr) => {
+				const low = this.mem.getUint32(addr + 0, true);
+				const high = this.mem.getInt32(addr + 4, true);
+				return low + high * 4294967296;
+			}
+
+			const loadValue = (addr) => {
+				const f = this.mem.getFloat64(addr, true);
+				if (f === 0) {
+					return undefined;
+				}
+				if (!isNaN(f)) {
+					return f;
+				}
+
+				const id = this.mem.getUint32(addr, true);
+				return this._values[id];
+			}
+
+			const storeValue = (addr, v) => {
+				const nanHead = 0x7FF80000;
+
+				if (typeof v === "number" && v !== 0) {
+					if (isNaN(v)) {
+						this.mem.setUint32(addr + 4, nanHead, true);
+						this.mem.setUint32(addr, 0, true);
+						return;
+					}
+					this.mem.setFloat64(addr, v, true);
+					return;
+				}
+
+				if (v === undefined) {
+					this.mem.setFloat64(addr, 0, true);
+					return;
+				}
+
+				let id = this._ids.get(v);
+				if (id === undefined) {
+					id = this._idPool.pop();
+					if (id === undefined) {
+						id = this._values.length;
+					}
+					this._values[id] = v;
+					this._goRefCounts[id] = 0;
+					this._ids.set(v, id);
+				}
+				this._goRefCounts[id]++;
+				let typeFlag = 0;
+				switch (typeof v) {
+					case "object":
+						if (v !== null) {
+							typeFlag = 1;
+						}
+						break;
+					case "string":
+						typeFlag = 2;
+						break;
+					case "symbol":
+						typeFlag = 3;
+						break;
+					case "function":
+						typeFlag = 4;
+						break;
+				}
+				this.mem.setUint32(addr + 4, nanHead | typeFlag, true);
+				this.mem.setUint32(addr, id, true);
+			}
+
+			const loadSlice = (addr) => {
+				const array = getInt64(addr + 0);
+				const len = getInt64(addr + 8);
+				return new Uint8Array(this._inst.exports.mem.buffer, array, len);
+			}
+
+			const loadSliceOfValues = (addr) => {
+				const array = getInt64(addr + 0);
+				const len = getInt64(addr + 8);
+				const a = new Array(len);
+				for (let i = 0; i < len; i++) {
+					a[i] = loadValue(array + i * 8);
+				}
+				return a;
+			}
+
+			const loadString = (addr) => {
+				const saddr = getInt64(addr + 0);
+				const len = getInt64(addr + 8);
+				return decoder.decode(new DataView(this._inst.exports.mem.buffer, saddr, len));
+			}
+
+			const testCallExport = (a, b) => {
+				this._inst.exports.testExport0();
+				return this._inst.exports.testExport(a, b);
+			}
+
+			const timeOrigin = Date.now() - performance.now();
+			this.importObject = {
+				_gotest: {
+					add: (a, b) => a + b,
+					callExport: testCallExport,
+				},
+				gojs: {
+					// Go's SP does not change as long as no Go code is running. Some operations (e.g. calls, getters and setters)
+					// may synchronously trigger a Go event handler. This makes Go code get executed in the middle of the imported
+					// function. A goroutine can switch to a new stack if the current stack is too small (see morestack function).
+					// This changes the SP, thus we have to update the SP used by the imported function.
+
+					// func wasmExit(code int32)
+					"runtime.wasmExit": (sp) => {
+						sp >>>= 0;
+						const code = this.mem.getInt32(sp + 8, true);
+						this.exited = true;
+						delete this._inst;
+						delete this._values;
+						delete this._goRefCounts;
+						delete this._ids;
+						delete this._idPool;
+						this.exit(code);
+					},
+
+					// func wasmWrite(fd uintptr, p unsafe.Pointer, n int32)
+					"runtime.wasmWrite": (sp) => {
+						sp >>>= 0;
+						const fd = getInt64(sp + 8);
+						const p = getInt64(sp + 16);
+						const n = this.mem.getInt32(sp + 24, true);
+						fs.writeSync(fd, new Uint8Array(this._inst.exports.mem.buffer, p, n));
+					},
+
+					// func resetMemoryDataView()
+					"runtime.resetMemoryDataView": (sp) => {
+						sp >>>= 0;
+						this.mem = new DataView(this._inst.exports.mem.buffer);
+					},
+
+					// func nanotime1() int64
+					"runtime.nanotime1": (sp) => {
+						sp >>>= 0;
+						setInt64(sp + 8, (timeOrigin + performance.now()) * 1000000);
+					},
+
+					// func walltime() (sec int64, nsec int32)
+					"runtime.walltime": (sp) => {
+						sp >>>= 0;
+						const msec = (new Date).getTime();
+						setInt64(sp + 8, msec / 1000);
+						this.mem.setInt32(sp + 16, (msec % 1000) * 1000000, true);
+					},
+
+					// func scheduleTimeoutEvent(delay int64) int32
+					"runtime.scheduleTimeoutEvent": (sp) => {
+						sp >>>= 0;
+						const id = this._nextCallbackTimeoutID;
+						this._nextCallbackTimeoutID++;
+						this._scheduledTimeouts.set(id, setTimeout(
+							() => {
+								this._resume();
+								while (this._scheduledTimeouts.has(id)) {
+									// for some reason Go failed to register the timeout event, log and try again
+									// (temporary workaround for https://github.com/golang/go/issues/28975)
+									console.warn("scheduleTimeoutEvent: missed timeout event");
+									this._resume();
+								}
+							},
+							getInt64(sp + 8),
+						));
+						this.mem.setInt32(sp + 16, id, true);
+					},
+
+					// func clearTimeoutEvent(id int32)
+					"runtime.clearTimeoutEvent": (sp) => {
+						sp >>>= 0;
+						const id = this.mem.getInt32(sp + 8, true);
+						clearTimeout(this._scheduledTimeouts.get(id));
+						this._scheduledTimeouts.delete(id);
+					},
+
+					// func getRandomData(r []byte)
+					"runtime.getRandomData": (sp) => {
+						sp >>>= 0;
+						crypto.getRandomValues(loadSlice(sp + 8));
+					},
+
+					// func finalizeRef(v ref)
+					"syscall/js.finalizeRef": (sp) => {
+						sp >>>= 0;
+						const id = this.mem.getUint32(sp + 8, true);
+						this._goRefCounts[id]--;
+						if (this._goRefCounts[id] === 0) {
+							const v = this._values[id];
+							this._values[id] = null;
+							this._ids.delete(v);
+							this._idPool.push(id);
+						}
+					},
+
+					// func stringVal(value string) ref
+					"syscall/js.stringVal": (sp) => {
+						sp >>>= 0;
+						storeValue(sp + 24, loadString(sp + 8));
+					},
+
+					// func valueGet(v ref, p string) ref
+					"syscall/js.valueGet": (sp) => {
+						sp >>>= 0;
+						const result = Reflect.get(loadValue(sp + 8), loadString(sp + 16));
+						sp = this._inst.exports.getsp() >>> 0; // see comment above
+						storeValue(sp + 32, result);
+					},
+
+					// func valueSet(v ref, p string, x ref)
+					"syscall/js.valueSet": (sp) => {
+						sp >>>= 0;
+						Reflect.set(loadValue(sp + 8), loadString(sp + 16), loadValue(sp + 32));
+					},
+
+					// func valueDelete(v ref, p string)
+					"syscall/js.valueDelete": (sp) => {
+						sp >>>= 0;
+						Reflect.deleteProperty(loadValue(sp + 8), loadString(sp + 16));
+					},
+
+					// func valueIndex(v ref, i int) ref
+					"syscall/js.valueIndex": (sp) => {
+						sp >>>= 0;
+						storeValue(sp + 24, Reflect.get(loadValue(sp + 8), getInt64(sp + 16)));
+					},
+
+					// valueSetIndex(v ref, i int, x ref)
+					"syscall/js.valueSetIndex": (sp) => {
+						sp >>>= 0;
+						Reflect.set(loadValue(sp + 8), getInt64(sp + 16), loadValue(sp + 24));
+					},
+
+					// func valueCall(v ref, m string, args []ref) (ref, bool)
+					"syscall/js.valueCall": (sp) => {
+						sp >>>= 0;
+						try {
+							const v = loadValue(sp + 8);
+							const m = Reflect.get(v, loadString(sp + 16));
+							const args = loadSliceOfValues(sp + 32);
+							const result = Reflect.apply(m, v, args);
+							sp = this._inst.exports.getsp() >>> 0; // see comment above
+							storeValue(sp + 56, result);
+							this.mem.setUint8(sp + 64, 1);
+						} catch (err) {
+							sp = this._inst.exports.getsp() >>> 0; // see comment above
+							storeValue(sp + 56, err);
+							this.mem.setUint8(sp + 64, 0);
+						}
+					},
+
+					// func valueInvoke(v ref, args []ref) (ref, bool)
+					"syscall/js.valueInvoke": (sp) => {
+						sp >>>= 0;
+						try {
+							const v = loadValue(sp + 8);
+							const args = loadSliceOfValues(sp + 16);
+							const result = Reflect.apply(v, undefined, args);
+							sp = this._inst.exports.getsp() >>> 0; // see comment above
+							storeValue(sp + 40, result);
+							this.mem.setUint8(sp + 48, 1);
+						} catch (err) {
+							sp = this._inst.exports.getsp() >>> 0; // see comment above
+							storeValue(sp + 40, err);
+							this.mem.setUint8(sp + 48, 0);
+						}
+					},
+
+					// func valueNew(v ref, args []ref) (ref, bool)
+					"syscall/js.valueNew": (sp) => {
+						sp >>>= 0;
+						try {
+							const v = loadValue(sp + 8);
+							const args = loadSliceOfValues(sp + 16);
+							const result = Reflect.construct(v, args);
+							sp = this._inst.exports.getsp() >>> 0; // see comment above
+							storeValue(sp + 40, result);
+							this.mem.setUint8(sp + 48, 1);
+						} catch (err) {
+							sp = this._inst.exports.getsp() >>> 0; // see comment above
+							storeValue(sp + 40, err);
+							this.mem.setUint8(sp + 48, 0);
+						}
+					},
+
+					// func valueLength(v ref) int
+					"syscall/js.valueLength": (sp) => {
+						sp >>>= 0;
+						setInt64(sp + 16, parseInt(loadValue(sp + 8).length));
+					},
+
+					// valuePrepareString(v ref) (ref, int)
+					"syscall/js.valuePrepareString": (sp) => {
+						sp >>>= 0;
+						const str = encoder.encode(String(loadValue(sp + 8)));
+						storeValue(sp + 16, str);
+						setInt64(sp + 24, str.length);
+					},
+
+					// valueLoadString(v ref, b []byte)
+					"syscall/js.valueLoadString": (sp) => {
+						sp >>>= 0;
+						const str = loadValue(sp + 8);
+						loadSlice(sp + 16).set(str);
+					},
+
+					// func valueInstanceOf(v ref, t ref) bool
+					"syscall/js.valueInstanceOf": (sp) => {
+						sp >>>= 0;
+						this.mem.setUint8(sp + 24, (loadValue(sp + 8) instanceof loadValue(sp + 16)) ? 1 : 0);
+					},
+
+					// func copyBytesToGo(dst []byte, src ref) (int, bool)
+					"syscall/js.copyBytesToGo": (sp) => {
+						sp >>>= 0;
+						const dst = loadSlice(sp + 8);
+						const src = loadValue(sp + 32);
+						if (!(src instanceof Uint8Array || src instanceof Uint8ClampedArray)) {
+							this.mem.setUint8(sp + 48, 0);
+							return;
+						}
+						const toCopy = src.subarray(0, dst.length);
+						dst.set(toCopy);
+						setInt64(sp + 40, toCopy.length);
+						this.mem.setUint8(sp + 48, 1);
+					},
+
+					// func copyBytesToJS(dst ref, src []byte) (int, bool)
+					"syscall/js.copyBytesToJS": (sp) => {
+						sp >>>= 0;
+						const dst = loadValue(sp + 8);
+						const src = loadSlice(sp + 16);
+						if (!(dst instanceof Uint8Array || dst instanceof Uint8ClampedArray)) {
+							this.mem.setUint8(sp + 48, 0);
+							return;
+						}
+						const toCopy = src.subarray(0, dst.length);
+						dst.set(toCopy);
+						setInt64(sp + 40, toCopy.length);
+						this.mem.setUint8(sp + 48, 1);
+					},
+
+					"debug": (value) => {
+						console.log(value);
+					},
+				}
+			};
+		}
+
+		async run(instance) {
+			if (!(instance instanceof WebAssembly.Instance)) {
+				throw new Error("Go.run: WebAssembly.Instance expected");
+			}
+			this._inst = instance;
+			this.mem = new DataView(this._inst.exports.mem.buffer);
+			this._values = [ // JS values that Go currently has references to, indexed by reference id
+				NaN,
+				0,
+				null,
+				true,
+				false,
+				globalThis,
+				this,
+			];
+			this._goRefCounts = new Array(this._values.length).fill(Infinity); // number of references that Go has to a JS value, indexed by reference id
+			this._ids = new Map([ // mapping from JS values to reference ids
+				[0, 1],
+				[null, 2],
+				[true, 3],
+				[false, 4],
+				[globalThis, 5],
+				[this, 6],
+			]);
+			this._idPool = [];   // unused ids that have been garbage collected
+			this.exited = false; // whether the Go program has exited
+
+			// Pass command line arguments and environment variables to WebAssembly by writing them to the linear memory.
+			let offset = 4096;
+
+			const strPtr = (str) => {
+				const ptr = offset;
+				const bytes = encoder.encode(str + "\0");
+				new Uint8Array(this.mem.buffer, offset, bytes.length).set(bytes);
+				offset += bytes.length;
+				if (offset % 8 !== 0) {
+					offset += 8 - (offset % 8);
+				}
+				return ptr;
+			};
+
+			const argc = this.argv.length;
+
+			const argvPtrs = [];
+			this.argv.forEach((arg) => {
+				argvPtrs.push(strPtr(arg));
+			});
+			argvPtrs.push(0);
+
+			const keys = Object.keys(this.env).sort();
+			keys.forEach((key) => {
+				argvPtrs.push(strPtr(`${key}=${this.env[key]}`));
+			});
+			argvPtrs.push(0);
+
+			const argv = offset;
+			argvPtrs.forEach((ptr) => {
+				this.mem.setUint32(offset, ptr, true);
+				this.mem.setUint32(offset + 4, 0, true);
+				offset += 8;
+			});
+
+			// The linker guarantees global data starts from at least wasmMinDataAddr.
+			// Keep in sync with cmd/link/internal/ld/data.go:wasmMinDataAddr.
+			const wasmMinDataAddr = 4096 + 8192;
+			if (offset >= wasmMinDataAddr) {
+				throw new Error("total length of command line and environment variables exceeds limit");
+			}
+
+			this._inst.exports.run(argc, argv);
+			if (this.exited) {
+				this._resolveExitPromise();
+			}
+			await this._exitPromise;
+		}
+
+		_resume() {
+			if (this.exited) {
+				throw new Error("Go program has already exited");
+			}
+			this._inst.exports.resume();
+			if (this.exited) {
+				this._resolveExitPromise();
+			}
+		}
+
+		_makeFuncWrapper(id) {
+			const go = this;
+			return function () {
+				const event = { id: id, this: this, args: arguments };
+				go._pendingEvent = event;
+				go._resume();
+				return event.result;
+			};
+		}
+	}
+})();
+
+</script>
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const ROUTINE = new Set(["append", "ack", "commit", "fsync", "upload"]);
+  const MODES = {
+    design: { ackPolicy: "quorum", dedup: true, eventTimeOrder: true, appendOnlyCorrections: true, acceptLate: true },
+    naive: { ackPolicy: "on-receive", dedup: false, eventTimeOrder: false, appendOnlyCorrections: false, acceptLate: false },
+  };
+
+  let A = null;           // the Go engine
+  let scenarios = [];
+  let S = null;           // latest state from the engine
+  let mode = "design";
+  let selected = "A";
+  let playing = false;
+  let acc = 0, lastT = 0, lastSlow = 0;
+  let logAll = false;
+  let events = [];
+  let lastCp = null;
+  let openVersions = null;
+  let stick = true; // keep the history table scrolled to its newest row
+  let invAll = false; // show every correctness check, not just the ones that fired
+  let tab = "sim";
+
+  // ---------- boot ----------
+  async function boot() {
+    try {
+      const go = new Go();
+      let inst;
+      try {
+        inst = await WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject);
+      } catch (e) {
+        const buf = await (await fetch("main.wasm")).arrayBuffer();
+        inst = await WebAssembly.instantiate(buf, go.importObject);
+      }
+      go.run(inst.instance);
+      A = window.ArchiveSim;
+      if (!A) throw new Error("engine did not start");
+      scenarios = JSON.parse(A.scenarios());
+      $("scenario").innerHTML = scenarios.map((s) => `<option value="${s.id}">${esc(s.case)} · ${esc(s.title)}</option>`).join("");
+      const h = location.hash.slice(1);
+      if (scenarios.some((s) => s.id === h)) $("scenario").value = h;
+      wire();
+      $("boot").hidden = true;
+      $("app").hidden = false;
+      load();
+      requestAnimationFrame(frame);
+      window.dispatchEvent(new Event("archive-ready"));
+    } catch (e) {
+      $("boot").classList.add("err");
+      $("boot").textContent = "The simulation engine couldn't start in this browser (" + e.message + "). Try the deployed site or a recent Chrome, Firefox or Safari.";
+    }
+  }
+
+  function config() {
+    let c;
+    if (mode === "custom") {
+      c = { ackPolicy: $("t-ack").value, dedup: $("t-dedup").checked, eventTimeOrder: $("t-order").checked,
+        appendOnlyCorrections: $("t-corr").checked, acceptLate: $("t-late").checked };
+    } else c = { ...MODES[mode] };
+    c.uploadEvery = +$("upload").value;
+    return c;
+  }
+
+  function load() {
+    const id = $("scenario").value;
+    try { history.replaceState(null, "", "#" + id); } catch (e) { /* ignore */ }
+    playing = false;
+    events = [];
+    lastCp = null;
+    openVersions = null;
+    $("log").innerHTML = "";
+    const sc = scenarios.find((s) => s.id === id);
+    selected = sc.focus || "A";
+    stick = true;
+    $("h-view").value = { corrections: "flagged", timestamps: "flagged", delayed: "late" }[id] || "latest";
+    apply(JSON.parse(A.load(id, JSON.stringify(config()), 42)));
+    if (sc.length > 0) apply(JSON.parse(A.step(1)));
+    slow();
+  }
+
+  // ---------- engine calls ----------
+  function step(n) { apply(JSON.parse(A.step(n))); }
+  function act(a) { apply(JSON.parse(A.act(JSON.stringify(a)))); slow(); }
+
+  function apply(st) {
+    if (!st || st.error) return;
+    S = st;
+    if (st.events && st.events.length) addEvents(st.events);
+    if (st.checkpoint) { lastCp = st.checkpoint; lastCp.fresh = true; setPlaying(false); }
+    render();
+  }
+
+  function setPlaying(p) {
+    playing = p;
+    $("play").textContent = p ? "Pause" : (lastCp && lastCp.fresh ? "Continue" : "Play");
+    if (p && lastCp) lastCp.fresh = false;
+    acc = 0;
+  }
+
+  function frame(t) {
+    const dt = Math.min(250, t - (lastT || t));
+    lastT = t;
+    if (playing && A) {
+      acc += dt * (+$("speed").value) / 1000;
+      const n = Math.floor(acc);
+      if (n > 0) { acc -= n; step(n); }
+      if (t - lastSlow > 700) slow();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // History and similarity are heavier: refresh them less often.
+  function slow() {
+    lastSlow = performance.now();
+    renderHistory();
+    if (tab === "sim") renderSimilar();
+  }
+
+  function setTab(t) {
+    tab = t;
+    for (const k of ["sim", "log", "store"]) {
+      $("tab-" + k).setAttribute("aria-selected", String(k === t));
+      $("pane-" + k).hidden = k !== t;
+    }
+    if (t === "sim") renderSimilar();
+  }
+
+  // ---------- wiring ----------
+  function wire() {
+    $("scenario").addEventListener("change", load);
+    $("restart").addEventListener("click", load);
+    $("upload").addEventListener("change", load);
+    for (const m of ["design", "naive", "custom"]) {
+      $("mode-" + m).addEventListener("click", () => {
+        mode = m;
+        for (const k of ["design", "naive", "custom"]) $("mode-" + k).setAttribute("aria-pressed", String(k === m));
+        $("custom").hidden = m !== "custom";
+        load();
+      });
+    }
+    for (const id of ["t-ack", "t-dedup", "t-order", "t-corr", "t-late"]) $(id).addEventListener("change", load);
+    $("play").addEventListener("click", () => setPlaying(!playing));
+    $("step1").addEventListener("click", () => { setPlaying(false); step(1); slow(); });
+    $("step10").addEventListener("click", () => { setPlaying(false); step(10); slow(); });
+    $("tonext").addEventListener("click", () => {
+      setPlaying(false);
+      const sc = S.scenario;
+      const limit = sc.length > 0 ? Math.max(1, sc.length + 30 - S.rel) : 60;
+      if (lastCp) lastCp.fresh = false;
+      step(limit);
+      slow();
+    });
+    $("arm-append").addEventListener("click", () => act({ type: "crashAfterAppend" }));
+    $("arm-ack").addEventListener("click", () => act({ type: "crashAfterAck" }));
+    $("nodes").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-act]");
+      if (b) act({ type: b.dataset.act, node: b.dataset.node });
+    });
+    $("stations").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-st]");
+      if (!b) return;
+      selected = b.dataset.st;
+      openVersions = null;
+      stick = true;
+      render();
+      slow();
+    });
+    $("a-online").addEventListener("click", () => {
+      const st = S.stations.find((x) => x.name === selected);
+      act({ type: st.online ? "offline" : "online", station: selected });
+    });
+    $("a-drop").addEventListener("click", () => act({ type: "dropAcks", station: selected, value: 20 }));
+    $("a-resend").addEventListener("click", () => act({ type: "resend", station: selected }));
+    $("a-jitter").addEventListener("change", (e) => act({ type: "jitter", station: selected, value: +e.target.value }));
+    $("a-skew").addEventListener("change", (e) => act({ type: "skew", station: selected, value: +e.target.value }));
+    $("a-schema").addEventListener("change", (e) => act({ type: "schema", station: selected, value: +e.target.value }));
+    $("a-conv").addEventListener("click", () => act({ type: "converter", value: 3 }));
+    $("corr").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const seq = +$("c-seq").value, val = +$("c-val").value;
+      if (seq > 0 && Number.isFinite(val)) act({ type: "correct", station: selected, seq, value: val });
+    });
+    $("h-body").addEventListener("click", (e) => {
+      const tr = e.target.closest("tr[data-seq]");
+      if (!tr) return;
+      $("c-seq").value = tr.dataset.seq;
+      $("c-val").value = tr.dataset.val;
+      $("corr-box").open = true;
+      openVersions = openVersions === tr.dataset.key ? null : tr.dataset.key;
+      renderHistory();
+    });
+    $("h-view").addEventListener("change", () => { stick = true; renderHistory(); });
+    $("h-wrap").addEventListener("scroll", () => {
+      const w = $("h-wrap");
+      stick = w.scrollTop + w.clientHeight >= w.scrollHeight - 30;
+    });
+    for (const k of ["sim", "log", "store"]) $("tab-" + k).addEventListener("click", () => setTab(k));
+    $("inv").addEventListener("click", (e) => {
+      if (e.target.closest("#inv-toggle")) { invAll = !invAll; renderInv(); }
+    });
+    // Close the settings popover when clicking elsewhere.
+    document.addEventListener("click", (e) => {
+      const m = document.querySelector(".menu[open]");
+      if (m && !m.contains(e.target)) m.open = false;
+    });
+    $("lf-key").addEventListener("click", () => setLog(false));
+    $("lf-all").addEventListener("click", () => setLog(true));
+    $("cp").addEventListener("click", (e) => {
+      if (e.target.id === "cp-go") setPlaying(true);
+    });
+    window.addEventListener("hashchange", () => {
+      const h = location.hash.slice(1);
+      if (h !== $("scenario").value && scenarios.some((s) => s.id === h)) { $("scenario").value = h; load(); }
+    });
+    window.addEventListener("resize", () => { renderHistory(); if (tab === "sim") renderSimilar(); });
+  }
+
+  function setLog(all) {
+    logAll = all;
+    $("lf-key").setAttribute("aria-pressed", String(!all));
+    $("lf-all").setAttribute("aria-pressed", String(all));
+    $("log").innerHTML = "";
+    const show = events.filter((e) => all || !ROUTINE.has(e.kind)).slice(-300);
+    $("log").insertAdjacentHTML("afterbegin", show.reverse().map(evHTML).join(""));
+  }
+
+  // ---------- rendering ----------
+  const relTime = (t) => "T+" + (t - S.now + S.rel);
+  const clockOf = (t) => {
+    if (t < 0) return "—";
+    const d = Math.floor(t / 1440), m = t % 1440;
+    return `D${d + 1} ${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  };
+
+  function render() {
+    if (!S) return;
+    $("clock").textContent = S.clock;
+    $("rel").textContent = `T+${S.rel} min`;
+    const L = S.scenario.length;
+    $("prog").style.width = L > 0 ? Math.min(100, (S.rel / L) * 100) + "%" : "100%";
+    renderScenario();
+    renderCheckpoint();
+    renderInv();
+    renderCluster();
+    renderStations();
+    renderDetail();
+    renderStorage();
+  }
+
+  function renderScenario() {
+    const sc = S.scenario;
+    const html = `<span class="case">${esc(sc.case)}</span>
+      <h2 class="scn-title" style="text-transform:none;letter-spacing:0;color:var(--ink)">${esc(sc.title)}</h2>
+      <p>${esc(sc.summary)}</p>
+      <details class="inline-more"><summary>What to watch</summary><ul class="watch">${sc.watch.map((w) => `<li>${esc(w)}</li>`).join("")}</ul></details>
+      ${sc.id === "sandbox" ? `<button class="btn sm" id="chaos-btn">${S.chaos ? "Turn chaos off" : "Turn chaos on"}</button>` : ""}`;
+    const el = $("scn");
+    if (el.dataset.k !== html) {
+      el.innerHTML = html;
+      el.dataset.k = html;
+      const cb = $("chaos-btn");
+      if (cb) cb.addEventListener("click", () => { act({ type: "chaos", value: S.chaos ? 0 : 1 }); setPlaying(true); });
+    }
+  }
+
+  function renderCheckpoint() {
+    const el = $("cp");
+    if (!lastCp) {
+      el.hidden = S.scenario.length > 0;
+      if (!el.hidden) return;
+      el.hidden = false;
+      el.innerHTML = `<h3>Free play</h3><p>Press Play, then break things: crash machines, cut stations off, lose acks or correct readings. Turn chaos on to let the simulator do it for you, and watch the correctness panel below.</p>`;
+      return;
+    }
+    el.hidden = false;
+    const done = S.done ? `<p class="sub">Scenario complete. Switch mode and press Restart to compare.</p>` : "";
+    const html = `<span class="cp-n">Pause ${lastCp.index} of ${lastCp.total} · T+${lastCp.at}</span>
+      <h3>${esc(lastCp.title)}</h3><p>${esc(lastCp.text)}</p>${done}
+      ${S.done || playing ? "" : `<div class="cp-actions"><button class="btn primary sm" id="cp-go">Continue</button></div>`}`;
+    if (el.dataset.k !== html) { el.innerHTML = html; el.dataset.k = html; }
+  }
+
+  function renderInv() {
+    const i = S.inv, s = S.stats;
+    const lost = i.lostAcked;
+    const checks = [
+      ["Duplicate rows stored", i.dupRows, "is-bad"],
+      ["Acknowledged, then dropped", i.ackedDropped, "is-bad", "late data rejected after the ack"],
+      ["Rows out of order in history", i.misordered, "is-bad"],
+      ["Values overwritten", i.overwrites, "is-bad", "original lost"],
+      ["Conflicting corrections", i.conflicts, "is-warn"],
+      ["Quarantined events", i.quarantined, "is-warn"],
+      ["Rows with suspect timestamps", i.flagged, "is-warn"],
+      ["Late arrivals placed by event time", i.outOfOrder, "is-good"],
+      ["Retries recognised", i.dupsIgnored + i.fastPathDups, "is-good"],
+      ["“Busy” replies (backpressure)", s.nackBusy, "is-warn"],
+      ["Writes refused, retry later", s.nackNoQuorum, "is-warn", "no leader, or fewer than 2 machines up"],
+      ["Leader elections", s.elections, ""],
+    ];
+    // Only list checks that have fired; the zeros fold into one line.
+    const shown = invAll ? checks : checks.filter((c) => c[1]);
+    const hidden = checks.length - shown.length;
+    const rows = shown.map(([label, v, cls, hint]) =>
+      `<dt>${label}${hint ? `<small>${hint}</small>` : ""}</dt><dd class="${v ? cls : ""}">${v}</dd>`).join("");
+    const toggle = invAll ? `<button class="all-clear" id="inv-toggle">Hide zero counts ▴</button>`
+      : hidden ? `<button class="all-clear" id="inv-toggle">✓ ${hidden} other check${hidden > 1 ? "s" : ""} at zero · show ▾</button>` : "";
+    const html = `<div class="panel-head"><h2>Correctness</h2><span class="sub">${S.inv.acked.toLocaleString()} acked</span></div>
+      <div class="hero-metric ${lost ? "bad" : ""}"><span class="num">${lost}</span>
+        <b>Acknowledged readings lost</b><span>${lost ? "Stations were told 'success' for data that no longer exists." : "Every 'success' sent is still backed by data."}</span></div>
+      ${rows ? `<dl class="metrics">${rows}</dl>` : ""}${toggle}`;
+    const el = $("inv");
+    if (el.dataset.k !== html) { el.innerHTML = html; el.dataset.k = html; }
+  }
+
+  function renderCluster() {
+    $("term").textContent = `term ${S.term}`;
+    const pct = Math.min(100, (S.backlog / 60) * 100);
+    $("cmeta").innerHTML = [
+      ["leader", S.leader || "none"], ["committed", S.commit], ["processed", S.applied],
+      ["uploaded", S.uploaded], ["in flight", S.inNetwork],
+    ].map(([k, v]) => `<span>${k} <b>${esc(v)}</b></span>`).join("") +
+      `<span class="mini" title="Processing backlog: the leader replies 'busy' above 60">backlog <span class="meter ${S.backlog > 45 ? "hot" : ""}"><i style="width:${pct}%"></i></span><b>${S.backlog}</b></span>`;
+    const html = S.nodes.map((n) => {
+      const cells = (n.tail || []).map((c) => {
+        let cls = "cell " + (!c.durable ? "cache" : c.committed ? "committed" : "disk");
+        if (c.uploaded) cls += " uploaded";
+        return `<span class="${cls}" title="entry ${c.index}: ${c.n} readings from ${c.station}"><small>${c.index % 1000}</small>${esc(c.station)}${c.n > 1 ? `<sub>${c.n}</sub>` : ""}</span>`;
+      }).join("");
+      const tape = n.logLen === 0 ? `<div class="tape-empty">${n.up ? "empty log" : "disk destroyed: nothing left on this machine"}</div>` : `<div class="tape">${cells}</div>`;
+      // Only offer the actions that make sense for the machine's current state.
+      const btn = (act, label, cls = "") => `<button class="btn sm ${cls}" data-act="${act}" data-node="${n.name}">${label}</button>`;
+      const actions = n.up ? btn("crash", "Crash", "") + btn("destroy", "Destroy", "danger")
+        : (n.logLen > 0 ? btn("restart", "Restart") : "") + btn("replace", "Replace");
+      return `<div class="node ${n.up ? "" : "down"}">
+        <div class="node-head"><h3>${esc(n.name)}</h3><span class="pill ${n.role}">${n.role}</span>
+          <span class="node-stats">${esc(n.zone)} · log ${n.logLen} · disk ${n.durable}${n.unsynced ? ` · <b style="color:var(--warn)">${n.unsynced} in cache</b>` : ""}</span>
+          <div class="node-actions">${actions}</div></div>
+        ${tape}</div>`;
+    }).join("");
+    const el = $("nodes");
+    if (el.dataset.k !== html) { el.innerHTML = html; el.dataset.k = html; }
+  }
+
+  function renderStations() {
+    const html = S.stations.map((s) => {
+      let dot = "", st = s.climate;
+      if (s.stopped) { dot = "silent"; st = "stopped"; }
+      else if (!s.online) { dot = "off"; st = "offline"; }
+      else if (s.silent) { dot = "silent"; st = "silent"; }
+      else if (s.acksLost || s.jitter > 1 || s.skew || s.schema !== 1) { dot = "warn"; }
+      return `<button class="stn" data-st="${s.name}" aria-pressed="${s.name === selected}">
+        <span class="stn-top"><i class="dot ${dot}"></i><b>${s.name}</b><span class="buf">${s.buffer || ""}</span></span>
+        <span>${esc(st)}</span></button>`;
+    }).join("");
+    const el = $("stations");
+    if (el.dataset.k !== html) { el.innerHTML = html; el.dataset.k = html; }
+  }
+
+  function renderDetail() {
+    const s = S.stations.find((x) => x.name === selected);
+    $("d-title").textContent = `Station ${s.name} · ${s.climate}`;
+    const bits = [
+      s.stopped ? "stopped for good" : s.online ? "online" : "offline",
+      `${s.buffer} waiting on station`, `${s.inflight} requests in flight`, `${s.stored} rows stored`,
+      `last heard ${clockOf(s.lastSeen)}`,
+    ];
+    if (s.acksLost) bits.push("acks being lost");
+    $("d-sub").textContent = bits.join(" · ");
+    $("a-online").textContent = s.online ? "Go offline" : "Come back online";
+    $("a-online").disabled = s.stopped;
+    if (document.activeElement !== $("a-jitter")) $("a-jitter").value = String(s.jitter > 5 ? 9 : s.jitter > 1 ? 5 : 1);
+    if (document.activeElement !== $("a-skew")) $("a-skew").value = ["0", "120", "-90"].includes(String(s.skew)) ? String(s.skew) : "0";
+    if (document.activeElement !== $("a-schema")) $("a-schema").value = String(s.schema);
+  }
+
+  function renderHistory() {
+    if (!A || !S) return;
+    const h = JSON.parse(A.history(selected, 0));
+    const all = h.rows || [];
+    const view = $("h-view").value;
+    const pick = view === "flagged" ? all.filter((r) => (r.flags && r.flags.length) || r.dup || r.versions.length > 1)
+      : view === "late" ? all.filter((r) => r.late > 30) : all;
+    const src = Object.entries(h.sources).map(([k, v]) => `${k} ${v}`).join(", ");
+    $("h-meta").innerHTML = `<span>Ordered by <b>${esc(h.orderedBy)}</b></span><span>${h.total} rows</span><span>merged from ${esc(src || "—")}</span>${h.misordered ? `<span style="color:var(--bad)">${h.misordered} rows out of order</span>` : ""}`;
+    const rows = pick.slice(-80);
+    let prev = -Infinity;
+    const html = rows.map((r) => {
+      const moved = r.eventTime < prev; prev = Math.max(prev, r.eventTime);
+      const flags = (r.flags || []).map((f) => `<span class="tag ${f === "conflict" ? "bad" : f === "corrected" ? "good" : "warn"}">${esc(f)}</span>`).join("") + (r.dup ? `<span class="tag bad">duplicate</span>` : "");
+      let tr = `<tr class="click ${r.dup ? "dup" : moved ? "moved" : ""}" data-seq="${r.seq}" data-val="${r.tempC}" data-key="${esc(r.key)}">
+        <td class="num">${r.seq}</td><td class="mono">${clockOf(r.eventTime)}</td><td class="mono">${clockOf(r.ingestTime)}</td>
+        <td class="num">${r.late > 0 ? r.late + "m" : r.late < 0 ? r.late + "m" : "0"}</td><td class="num">${r.tempC.toFixed(1)}</td>
+        <td class="num">v${r.version}${r.versions.length > 1 ? `<small>/${r.versions.length}</small>` : ""}</td>
+        <td class="tier-${r.tier}">${r.tier}</td><td>${flags}</td></tr>`;
+      if (openVersions === r.key) {
+        tr += `<tr class="versions"><td colspan="8">${r.versions.map((v) => `v${v.version}: ${v.tempC.toFixed(1)}°C from ${esc(v.eventKey)} at ${clockOf(v.appliedAt)}${v.conflict ? " <span class='tag bad'>conflict</span>" : ""}`).join("<br>")}</td></tr>`;
+      }
+      return tr;
+    }).join("");
+    const wrap = $("h-wrap");
+    $("h-body").innerHTML = html;
+    if (stick) wrap.scrollTop = wrap.scrollHeight;
+    if (!rows.length) $("h-body").innerHTML = `<tr><td colspan="8" class="sub">No rows match this view for station ${selected} yet.</td></tr>`;
+    drawHistory(all.slice(-80));
+  }
+
+  function tok(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+  function setupCanvas(c) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    const g = c.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    g.font = `11px ${tok("--f-mono")}`;
+    return [g, w, h];
+  }
+
+  function drawHistory(rows) {
+    const [g, w, h] = setupCanvas($("h-chart"));
+    if (!rows.length) return;
+    const pad = { l: 40, r: 10, t: 10, b: 20 };
+    const xs = rows.map((r) => r.eventTime), ys = rows.map((r) => r.tempC);
+    let x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    if (x1 === x0) x1 = x0 + 1;
+    const yp = Math.max(0.5, (y1 - y0) * 0.1); y0 -= yp; y1 += yp;
+    const X = (v) => pad.l + ((v - x0) / (x1 - x0)) * (w - pad.l - pad.r);
+    const Y = (v) => pad.t + (1 - (v - y0) / (y1 - y0)) * (h - pad.t - pad.b);
+    g.strokeStyle = tok("--line"); g.fillStyle = tok("--ink-3"); g.lineWidth = 1;
+    for (let k = 0; k <= 3; k++) {
+      const v = y0 + ((y1 - y0) * k) / 3, y = Y(v);
+      g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
+      g.fillText(v.toFixed(1) + "°", 2, y + 4);
+    }
+    g.fillText(clockOf(x0), pad.l, h - 4);
+    const r1 = clockOf(x1); g.fillText(r1, w - pad.r - g.measureText(r1).width, h - 4);
+    // Line drawn in stored order: in event-time order it runs left to right;
+    // in arrival order it doubles back wherever a reading arrived late.
+    g.strokeStyle = tok("--accent"); g.lineWidth = 1.5; g.beginPath();
+    rows.forEach((r, i) => (i ? g.lineTo(X(r.eventTime), Y(r.tempC)) : g.moveTo(X(r.eventTime), Y(r.tempC))));
+    g.stroke();
+    for (const r of rows) {
+      const f = r.flags || [];
+      let col = null;
+      if (r.dup || f.includes("conflict")) col = tok("--bad");
+      else if (f.includes("corrected")) col = tok("--good");
+      else if (f.length || r.tier === "delta") col = tok("--warn");
+      if (!col) continue;
+      g.fillStyle = col; g.beginPath(); g.arc(X(r.eventTime), Y(r.tempC), 3.5, 0, Math.PI * 2); g.fill();
+    }
+  }
+
+  function renderSimilar() {
+    if (!A || !S) return;
+    const r = JSON.parse(A.similar(selected));
+    $("s-target").textContent = selected;
+    $("s-sub").textContent = r.dims ? `${r.dims} numbers per station · ${r.ops} multiply-adds` : "";
+    const ms = r.matches || [];
+    $("matches").innerHTML = r.targetVec ? ms.map((m) => `<div class="match ${m.excluded ? "ex" : ""}" title="${m.excluded ? esc(m.reason) : "distance " + m.distance}">
+        <b>${m.station}</b><span>${esc(m.climate)}</span><span class="bar"><i style="width:${m.excluded ? 0 : Math.round(m.score * 100)}%"></i></span>
+        <span class="num">${m.excluded ? "skip" : m.score.toFixed(2)}</span></div>`).join("")
+      : `<span class="sub">Station ${selected} has under 70% data coverage in the last 2 days, so it isn't compared.</span>`;
+    const ex = r.targetVec ? ms.filter((m) => m.excluded).map((m) => `${m.station} skipped: ${m.reason}`) : [];
+    $("s-note").textContent = "Average temperature for each hour of the day over the last 2 days." + (ex.length ? " " + ex.join("; ") + "." : "");
+    drawProfiles(r, ms);
+  }
+
+  function drawProfiles(r, ms) {
+    const [g, w, h] = setupCanvas($("s-chart"));
+    const P = r.profiles || {};
+    const target = P[selected];
+    const best = ms.find((m) => !m.excluded);
+    const names = Object.keys(P);
+    if (!names.length) return;
+    let y0 = Infinity, y1 = -Infinity;
+    for (const n of names) for (const v of P[n]) { y0 = Math.min(y0, v); y1 = Math.max(y1, v); }
+    const pad = { l: 36, r: 46, t: 8, b: 18 };
+    const X = (i) => pad.l + (i / 23) * (w - pad.l - pad.r);
+    const Y = (v) => pad.t + (1 - (v - y0) / (y1 - y0 || 1)) * (h - pad.t - pad.b);
+    g.fillStyle = tok("--ink-3"); g.strokeStyle = tok("--line"); g.lineWidth = 1;
+    for (const v of [y0, (y0 + y1) / 2, y1]) { g.beginPath(); g.moveTo(pad.l, Y(v)); g.lineTo(w - pad.r, Y(v)); g.stroke(); g.fillText(Math.round(v) + "°", 2, Y(v) + 4); }
+    for (const hr of [0, 6, 12, 18]) g.fillText(String(hr).padStart(2, "0") + "h", X(hr) - 8, h - 4);
+    const line = (vals, col, wdt, label) => {
+      g.strokeStyle = col; g.lineWidth = wdt; g.beginPath();
+      vals.forEach((v, i) => (i ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)))); g.stroke();
+      if (label) { g.fillStyle = col; g.fillText(label, w - pad.r + 6, Y(vals[23]) + 4); }
+    };
+    for (const n of names) if (n !== selected && (!best || n !== best.station)) line(P[n], tok("--hatch"), 1, null);
+    if (best && P[best.station]) line(P[best.station], tok("--good"), 2, best.station);
+    if (target) line(target, tok("--accent"), 2.5, selected);
+  }
+
+  function renderStorage() {
+    const parts = S.partitions || [];
+    const days = [...new Set(parts.map((p) => p.day))].sort((a, b) => a - b);
+    let html = `<span></span>${[0, 1, 2, 3].map((b) => `<span class="h">b${b}</span>`).join("")}`;
+    for (const d of days) {
+      html += `<span class="d">day ${d + 1}</span>`;
+      for (let b = 0; b < 4; b++) {
+        const p = parts.find((x) => x.day === d && x.bucket === b);
+        if (!p) { html += `<span></span>`; continue; }
+        html += `<span class="part ${p.sealed ? "sealed" : ""}" title="${p.sealed ? "sealed Parquet" : "still recent"}${p.rewrites ? ", rewritten " + p.rewrites + "×" : ""}">${p.sealed ? p.rows : "live"}${p.delta ? ` <span class="delta">+${p.delta}</span>` : ""}${p.rewrites ? "↻" : ""}</span>`;
+      }
+    }
+    const el = $("parts");
+    if (el.dataset.k !== html) { el.innerHTML = html; el.dataset.k = html; }
+    const q = S.quarantine || [];
+    $("q-n").textContent = q.length ? `${S.inv.quarantined} held` : "empty";
+    $("q-badge").hidden = !S.inv.quarantined;
+    $("q-badge").textContent = S.inv.quarantined;
+    const qh = q.slice().reverse().slice(0, 8).map((x) => `<li><span class="mono">${esc(x.reading.station)}#${x.reading.seq}</span> · ${esc(x.reason)}</li>`).join("");
+    if ($("qlist").dataset.k !== qh) { $("qlist").innerHTML = qh; $("qlist").dataset.k = qh; }
+  }
+
+  function evHTML(e) {
+    const cls = e.kind === "checkpoint" ? "checkpoint" : e.level;
+    return `<div class="ev ${cls}"><time>${relTime(e.t)}</time><div><span class="k">${esc(e.kind)}</span>${esc(e.msg)}</div></div>`;
+  }
+
+  function addEvents(list) {
+    events.push(...list);
+    if (events.length > 3000) events = events.slice(-3000);
+    const show = list.filter((e) => logAll || !ROUTINE.has(e.kind));
+    if (!show.length) return;
+    const log = $("log");
+    log.insertAdjacentHTML("afterbegin", show.slice(-200).reverse().map(evHTML).join(""));
+    while (log.childElementCount > 400) log.lastElementChild.remove();
+  }
+
+  // ---------- guided tour ----------
+  // Dims the page, spotlights one area at a time and explains what it shows
+  // and what to look out for. Opens on a first visit; "? Guide" reopens it.
+  const sw = (c) => `<i style="background:var(${c})"></i>`;
+  const TOUR = [
+    { title: "Welcome to the archive",
+      text: "This page simulates an archive that collects temperature readings from 12 weather stations and keeps them on 3 cheap machines. Things go wrong on purpose: crashes, lost replies, late data, bad clocks, corrections. The question is always the same: does the archive still tell the truth?",
+      look: ["Everything is computed live by the Go engine in your browser, so nothing is pre-recorded and every run reacts to what you click."] },
+    { sel: "#scenario", title: "1 · Pick a story",
+      text: "Each case is a scripted failure with a few built-in pauses that explain what's going on. Start with Case 1. The Sandbox is free play, with a chaos switch that breaks things at random.",
+      look: ["Each case has its own 'What to watch' list in the left column."] },
+    { sel: "#mode-seg", title: "2 · My design vs Naive",
+      text: "My design has every safeguard switched on. Naive switches them all off: it says 'success' the moment data arrives, stores retries twice, sorts by arrival time and overwrites old values. Custom lets you flip each safeguard yourself.",
+      look: ["Run a case in My design, then switch to Naive and watch the same events. The scoreboard tells two very different stories."] },
+    { sel: ".transport", title: "3 · Driving the clock",
+      text: "One tick is one simulated minute. Play runs continuously, +1 and +10 step forward, and Next pause jumps to the next explanation. The bar shows how far through the scenario you are.",
+      look: ["The simulation stops itself at every important moment, so you won't miss it. Use +1 min around those moments to see each step."] },
+    { sel: "#cp", title: "4 · The pause card",
+      text: "Whenever the simulation stops, this card says what's about to happen and why it matters. Read it, press Continue, and watch the parts of the screen it mentions.",
+      look: ["The text often tells you which station or counter to watch next."] },
+    { sel: "#inv", title: "5 · The scoreboard",
+      text: "This is the most important panel. The big number counts readings a station was told were saved but that no longer exist. It should always be 0. Below it, only the checks that have actually fired are listed.",
+      look: [
+        "<b style='color:var(--bad);display:inline'>Red</b>: the archive broke a promise (duplicates, out-of-order history, overwritten values, acked data dropped).",
+        "<b style='color:var(--warn);display:inline'>Amber</b>: the system pushed back (busy, retry later) or set data aside. This is healthy.",
+        "<b style='color:var(--good);display:inline'>Green</b>: a safeguard caught something, such as a retry being recognised.",
+      ] },
+    { sel: "#cluster", title: "6 · The replicated log",
+      text: "Every batch of readings is appended to a log copied onto 3 machines. One is the leader and the others follow. Each square is one log entry, labelled with the station it came from.",
+      keys: `<span>${sw("--warn-soft")}dashed: only in memory, a crash loses it</span><span>${sw("--panel-2")}on this disk</span><span>${sw("--accent-soft")}on 2 of 3 disks: safe</span><span>${sw("--good")}dot: also in object storage</span>`,
+      look: ["Press Crash on the leader: another machine is elected and nothing that was committed disappears.", "Crash two machines: writes are refused (not lost) until a majority is back."] },
+    { sel: "#stations", title: "7 · The stations",
+      text: "Each tile is a weather station. The number next to its name is how many readings are waiting on the station itself, not yet accepted by the archive. Click a tile to inspect that station below.",
+      keys: `<span>${sw("--good")}healthy</span><span>${sw("--warn")}something odd (delay, clock, lost acks)</span><span>${sw("--bad")}offline</span><span>${sw("--ink-3")}silent</span>`,
+      look: ["When a station goes offline its number grows. When it comes back, everything it buffered should arrive without gaps or duplicates."] },
+    { sel: "#detail .detail-head", title: "8 · Break a station",
+      text: "Take the station offline, make the archive's 'success' replies get lost (so the station retries data that was already saved), or resend its last batch. 'More station faults' adds network delay, a wrong clock and a unit change (°C → °F → Kelvin).",
+      look: ["After a retry, 'Retries recognised' should go up, not 'Duplicate rows stored'."] },
+    { sel: "#h-chart", title: "9 · The station's history",
+      text: "This line is the selected station's temperature, drawn in the order the archive stored it. Stored by measurement time, it runs smoothly left to right. Stored by arrival time, it doubles back wherever a reading arrived late.",
+      keys: `<span>${sw("--bad")}duplicate / conflict</span><span>${sw("--good")}corrected</span><span>${sw("--warn")}flagged or in a patch file</span>`,
+      look: ["A zig-zag that runs backwards means history is out of order. Compare Case 1 in both modes."] },
+    { sel: "#h-wrap", title: "10 · Row by row",
+      text: "Late is how many minutes after measurement the reading arrived. Ver counts corrections to that reading. Tier shows where the row lives: recent (fresh data), parquet (sealed daily files) or delta (a patch added to an already sealed file).",
+      look: ["Red rows are duplicates and amber rows are out of order. In My design you shouldn't see either.", "Click any row to see every version of it and prefill the correction form."] },
+    { sel: "#extras", title: "11 · More evidence",
+      text: "Similar stations compares each station's daily temperature curve to find look-alikes. Event log narrates what happened (switch to Everything for low-level detail). Storage shows the sealed files and the quarantine.",
+      look: ["A badge on Storage means readings were quarantined: kept safely but set aside, such as a new unit format with no converter yet. They're replayed later, not dropped."] },
+    { sel: "#tour-btn", title: "You're ready",
+      text: "Suggested first run: choose Case 1, press Play and read each pause. Then switch to Naive and run it again. Reopen this guide any time from this button.",
+      look: [] },
+  ];
+  let tourI = -1, tourEls = null;
+
+  function tourStart() {
+    setPlaying(false);
+    document.querySelectorAll(".menu[open]").forEach((m) => (m.open = false));
+    if (!tourEls) {
+      const block = document.createElement("div"); block.className = "tour-block";
+      const hole = document.createElement("div"); hole.className = "tour-hole";
+      const card = document.createElement("div"); card.className = "tour-card";
+      card.setAttribute("role", "dialog"); card.setAttribute("aria-modal", "true"); card.setAttribute("aria-label", "Guided tour");
+      card.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-t]");
+        if (!b) return;
+        if (b.dataset.t === "next") tourGo(tourI + 1, 1);
+        else if (b.dataset.t === "back") tourGo(tourI - 1, -1);
+        else tourEnd();
+      });
+      tourEls = { block, hole, card };
+    }
+    document.body.append(tourEls.block, tourEls.hole, tourEls.card);
+    tourGo(0, 1);
+  }
+
+  function tourEnd() {
+    if (!tourEls) return;
+    tourEls.block.remove(); tourEls.hole.remove(); tourEls.card.remove();
+    tourI = -1;
+    try { localStorage.setItem("archive-sim-tour", "1"); } catch (e) { /* storage unavailable */ }
+    $("tour-btn").focus();
+  }
+
+  const tourTarget = (s) => {
+    if (!s.sel) return null;
+    const el = document.querySelector(s.sel);
+    if (!el || el.closest("[hidden]") || !el.getClientRects().length) return null;
+    return el;
+  };
+
+  // dir lets us skip steps whose target isn't on screen (e.g. no pause card in Sandbox).
+  function tourGo(i, dir) {
+    while (i >= 0 && i < TOUR.length && TOUR[i].sel && !tourTarget(TOUR[i])) i += dir;
+    if (i < 0) i = 0;
+    if (i >= TOUR.length) return tourEnd();
+    tourI = i;
+    const s = TOUR[i], last = i === TOUR.length - 1;
+    const look = s.look && s.look.length
+      ? `<div class="tour-look"><b>Look out for</b>${s.look.length > 1 ? `<ul>${s.look.map((l) => `<li>${l}</li>`).join("")}</ul>` : s.look[0]}</div>` : "";
+    tourEls.card.innerHTML = `<span class="t-step">Guide · ${i + 1} of ${TOUR.length}</span>
+      <h3>${s.title}</h3><p>${s.text}</p>${s.keys ? `<div class="tour-keys">${s.keys}</div>` : ""}${look}
+      <div class="tour-nav"><div class="tour-dots">${TOUR.map((_, k) => `<span class="${k === i ? "on" : ""}"></span>`).join("")}</div>
+        ${i > 0 ? `<button class="btn sm" data-t="back">Back</button>` : `<button class="btn sm ghost" data-t="skip">Skip</button>`}
+        <button class="btn sm primary" data-t="next">${last ? "Finish" : i === 0 ? "Show me around" : "Next"}</button></div>`;
+    const el = tourTarget(s);
+    if (el) el.scrollIntoView({ block: "center" });
+    tourPlace();
+    tourEls.card.querySelector('[data-t="next"]').focus({ preventScroll: true });
+  }
+
+  function tourPlace() {
+    if (tourI < 0) return;
+    const { hole, card } = tourEls;
+    const el = tourTarget(TOUR[tourI]);
+    const vw = window.innerWidth, vh = window.innerHeight, M = 16, P = 6;
+    if (!el) {
+      hole.classList.add("center");
+      card.style.left = Math.max(M, (vw - card.offsetWidth) / 2) + "px";
+      card.style.top = Math.max(M, (vh - card.offsetHeight) / 2) + "px";
+      return;
+    }
+    hole.classList.remove("center");
+    const r = el.getBoundingClientRect();
+    const top = Math.max(r.top - P, 0), bot = Math.min(r.bottom + P, vh);
+    Object.assign(hole.style, { top: top + "px", left: (r.left - P) + "px", width: (r.width + P * 2) + "px", height: Math.max(0, bot - top) + "px" });
+    const cw = card.offsetWidth, ch = card.offsetHeight;
+    let x, y;
+    if (vh - bot >= ch + M) { y = bot + 10; x = r.left; }                  // below
+    else if (top >= ch + M) { y = top - ch - 10; x = r.left; }             // above
+    else if (vw - r.right >= cw + M * 2) { x = r.right + 14; y = r.top; }  // right
+    else if (r.left >= cw + M * 2) { x = r.left - cw - 14; y = r.top; }    // left
+    else { x = vw - cw - M; y = vh - ch - M; }                             // overlap, bottom corner
+    card.style.left = Math.min(Math.max(M, x), vw - cw - M) + "px";
+    card.style.top = Math.min(Math.max(M, y), vh - ch - M) + "px";
+  }
+
+  $("tour-btn").addEventListener("click", tourStart);
+  window.addEventListener("resize", tourPlace);
+  window.addEventListener("scroll", tourPlace, true);
+  document.addEventListener("keydown", (e) => {
+    if (tourI < 0) return;
+    if (e.key === "Escape") tourEnd();
+    else if (e.key === "ArrowRight") tourGo(tourI + 1, 1);
+    else if (e.key === "ArrowLeft" && tourI > 0) tourGo(tourI - 1, -1);
+  });
+  // First visit: open the guide once the engine is up.
+  window.addEventListener("archive-ready", () => {
+    let seen = false;
+    try { seen = localStorage.getItem("archive-sim-tour") === "1"; } catch (e) { /* storage unavailable */ }
+    if (!seen) setTimeout(tourStart, 400);
+  }, { once: true });
+
+  boot();
+})();
+
+</script>
+
+</body>
+</html>
